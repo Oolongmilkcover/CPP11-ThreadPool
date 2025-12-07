@@ -253,8 +253,33 @@ public:
         std::cout << "[添加任务] 任务" << *static_cast<int*>(arg) << "添加成功，当前队列任务数=" << queueSize << std::endl;
         return true;
     }
+    // 对外接口：安全关闭线程池,测试提前关闭线程数时用
+    void shutdownPool(){ 
+        shutdown = true; 
+        isFull.notify_all(); 
+        isEmpty.notify_all(); 
+    }
 
 private:
+    // ========== 新增RAII类：自动管理busyNum ==========
+    class BusyNumGuard {
+    public:
+        BusyNumGuard(std::atomic<int>& busyNum, std::mutex& lock)
+            : m_busyNum(busyNum), m_lock(lock) {
+            std::lock_guard<std::mutex> guard(m_lock);
+            m_busyNum++; // 构造时加1
+        }
+        ~BusyNumGuard() {
+            std::lock_guard<std::mutex> guard(m_lock);
+            m_busyNum--; // 析构时减1（无论是否抛异常）
+        }
+        // 禁止拷贝/移动
+        BusyNumGuard(const BusyNumGuard&) = delete;
+        BusyNumGuard& operator=(const BusyNumGuard&) = delete;
+    private:
+        std::atomic<int>& m_busyNum;
+        std::mutex& m_lock;
+    };
     // 工作线程核心函数：循环等待任务→执行任务→更新状态
     void workerFunc() {
         std::thread::id curTid = std::this_thread::get_id();  // 当前线程ID
@@ -299,27 +324,23 @@ private:
 
                 // 8. 执行任务：标记为忙线程
                 {
-                    std::lock_guard<std::mutex> lock(busyNumLock);  // 单独加锁保护busyNum
-                    busyNum++;
-                }
-                std::cout << "[执行任务] 线程" << curTid << " 开始执行任务" << *static_cast<int*>(task.arg.get()) << std::endl;
-                if (task.function != nullptr) {
-                    task.function(task.arg.get());  // 调用回调函数执行任务
-                }
-                std::cout << "[执行任务] 线程" << curTid << " 完成任务" << *static_cast<int*>(task.arg.get()) << std::endl;
-
-                {
-                    std::lock_guard<std::mutex> lock(busyNumLock);
-                    busyNum--;  // 任务完成，忙线程数减1
-                }
+                    BusyNumGuard guard(busyNum, busyNumLock); // 自动加1
+                    std::cout << "[执行任务] 线程" << curTid << " 开始执行任务" << *static_cast<int*>(task.arg.get()) << std::endl;
+                    if (task.function != nullptr) {
+                        task.function(task.arg.get());  // 调用回调函数（可能抛异常）
+                    }
+                    std::cout << "[执行任务] 线程" << curTid << " 完成任务" << *static_cast<int*>(task.arg.get()) << std::endl;
+                } // guard析构，自动减1（无论是否抛异常）
             }
         }
         // 异常处理：确保线程退出时标记完成
         catch (const std::exception& e) {
             std::cerr << "[异常] 工作线程" << curTid << " 异常退出：" << e.what() << std::endl;
+            liveNum.fetch_sub(1);// 异常退出时，存活线程数减1
         }
         catch (...) {
             std::cerr << "[异常] 工作线程" << curTid << " 未知异常退出" << std::endl;
+            liveNum.fetch_sub(1);//就是liveNum--，但是更装 
         }
 
         // 核心：线程退出时，标记自己为「已完成」（供管理者线程清理）
@@ -358,11 +379,12 @@ private:
 
             // ========== 扩容逻辑：任务堆积，线程数不足 ==========
             // 条件：任务数>存活线程数（处理不过来） 且 存活线程数<最大线程数（未达上限）
-            if (curQueue > curLive && curLive < maxNum) {
+            // 加入异常测试后发现，当curLive<minNum时也需要扩容，否则不能保证最小核心数
+            if (curLive<minNum || (curQueue > curLive && curLive < maxNum)) {
                 std::lock_guard<std::mutex> lock(poolLock);  // 加锁保护线程列表
                 int addCount = 0;
                 // 批量新增线程：最多ADDCOUNT个，避免一次性创建过多
-                while (curLive < maxNum && addCount < ADDCOUNT && queueSize > curLive) {
+                while (curLive < maxNum && addCount < ADDCOUNT && (queueSize > curLive||curLive<minNum)) {
                     workerWorkers.emplace_back(
                         std::thread([this]() { this->workerFunc(); })
                     );
