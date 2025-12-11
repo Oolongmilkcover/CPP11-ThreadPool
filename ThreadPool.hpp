@@ -15,6 +15,13 @@
 // 每次扩容/缩容的线程数（批量操作，避免频繁创建/销毁）
 constexpr int ADDCOUNT = 2;
 
+enum class PoolMode
+{
+    FIXED,
+    CACHED,
+};
+
+
 // 任务结构体：封装「回调函数+参数」，实现任意类型任务的通用管理
 struct Task {
     // 回调函数类型别名：接收void*参数，无返回值（通用任务格式）
@@ -66,6 +73,18 @@ struct Task {
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
 };
+
+/*
+    FIXED模式是固定模式，默认线程个数是cpu核心数量也可以自己传入参数
+
+    CACHED模式可调节容量的模式
+
+    加一个构造函数使得可以调节模式
+    若是FIXED模式的话就可以传入三个参数是Threadpool pool(FIXED,线程数量，最大任务数量)
+    若是CACHED模式的话就可以传入四个参数是Threadpool pool(FIXED,最小线程数量，最大线程数，最大任务数量)
+
+*/
+
 
 // 线程池核心类：管理工作线程、任务队列、动态扩缩容、资源回收
 class ThreadPool {
@@ -129,11 +148,46 @@ private:
     std::atomic<int> exitNum;              // 待退出线程数：管理者线程标记需要销毁的线程数
     std::atomic<bool> shutdown;            // 线程池关闭标志：true=关闭，false=运行
 
+    PoolMode poolmode; //线程池模式
+
 public:
+    //FIXED模式，参数PoolMode::FIXED 最大任务数量  线程数量
+    ThreadPool(PoolMode mode, int queueCapacity, int livenum = std::thread::hardware_concurrency())
+        :poolmode(mode)
+        , queueCapacity(queueCapacity)
+        , queueSize(0)          // 初始任务数：0
+        , liveNum(livenum)          // 初始存活线程数=核心线程数
+        , busyNum(0)            // 初始忙线程数：0
+        , minNum(livenum)
+        , maxNum(livenum)
+        , exitNum(0)
+        , shutdown(false)       // 初始状态：运行中
+    {
+        // 参数合法性校验：避免无效配置（如min<=0、max<min）
+        if (mode != PoolMode::FIXED || livenum <= 0 || queueCapacity <= 0 ) {
+            std::cerr << "输入参数不合法，此线程池初始化失败....." << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        // 预留线程列表空间：避免vector频繁扩容导致线程对象拷贝（线程不可拷贝）
+        workerWorkers.reserve(maxNum);
+
+        // 创建最小核心工作线程：保证线程池启动后有基础线程处理任务
+        for (int i = 0; i < liveNum; i++) {
+            // emplace_back：直接在vector中构造WorkerStatus对象（避免临时对象）
+            // lambda捕获this：让线程函数能访问线程池的成员变量/函数
+            workerWorkers.emplace_back(
+                std::thread([this]() { this->workerFunc(); })
+            );
+            std::cout << "[初始化] 创建核心工作线程，tid=" << workerWorkers.back().tid << std::endl;
+        }
+    }
+
+
     // 构造函数：初始化线程池参数，创建核心工作线程和管理者线程
-    // min：最小核心线程数；max：最大线程数；queueCapacity：任务队列容量
-    ThreadPool(int min, int max, int queueCapacity)
-        : queueCapacity(queueCapacity)
+    // 线程池模式,queueCapacity：任务队列容量,min：最小核心线程数；max：最大线程数；
+    ThreadPool(PoolMode mode, int queueCapacity,int min, int max)
+        :poolmode(mode)
+        ,queueCapacity(queueCapacity)
         , queueSize(0)          // 初始任务数：0
         , liveNum(min)          // 初始存活线程数=核心线程数
         , busyNum(0)            // 初始忙线程数：0
@@ -143,9 +197,9 @@ public:
         , shutdown(false)       // 初始状态：运行中
     {
         // 参数合法性校验：避免无效配置（如min<=0、max<min）
-        if (min <= 0 || queueCapacity <= 0 || min > max) {
-            std::cerr << "线程池参数非法：min=" << min << " max=" << max << " queueCapacity=" << queueCapacity << std::endl;
-            exit(EXIT_FAILURE);  // 非法参数直接退出程序
+        if (mode!=PoolMode::CACHED||min <= 0 || queueCapacity <= 0 || min > max) {
+            std::cerr << "输入参数不合法，此线程池初始化失败....." << std::endl;
+            exit(EXIT_FAILURE);
         }
 
         // 预留线程列表空间：避免vector频繁扩容导致线程对象拷贝（线程不可拷贝）
@@ -172,13 +226,15 @@ public:
 
         // 标记线程池关闭：通知所有线程准备退出
         shutdown = true;
-
         // 唤醒所有阻塞的线程：避免线程永久阻塞在条件变量上
+        // 双重唤醒：确保所有阻塞线程被唤醒（避免遗漏）
+        isEmpty.notify_all();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 给线程响应时间
         isFull.notify_all();   // 唤醒阻塞在「任务队列满」的添加任务线程
         isEmpty.notify_all();  // 唤醒阻塞在「任务队列为空」的工作线程
 
         // 回收管理者线程：等待其执行完退出
-        if (managerThread.joinable()) {
+        if (poolmode == PoolMode::CACHED && managerThread.joinable()) {
             managerThread.join();
             std::cout << "[析构] 管理者线程已回收，tid=" << managerThread.get_id() << std::endl;
         }
@@ -213,7 +269,7 @@ public:
     // 对外接口：获取当前线程列表大小（调试用，线程安全）
     int getWorkerListSize() {
         std::lock_guard<std::mutex> lock(poolLock);  // 加锁保护线程列表
-        return workerWorkers.size();
+        return static_cast<int>(workerWorkers.size());
     }
 
     // 对外接口：添加任务到线程池（线程安全）
@@ -254,10 +310,10 @@ public:
         return true;
     }
     // 对外接口：安全关闭线程池,测试提前关闭线程数时用
-    void shutdownPool(){ 
-        shutdown = true; 
-        isFull.notify_all(); 
-        isEmpty.notify_all(); 
+    void shutdownPool() {
+        shutdown = true;
+        isFull.notify_all();
+        isEmpty.notify_all();
     }
 
 private:
@@ -297,6 +353,7 @@ private:
 
                 // 3. 线程池已关闭：退出循环
                 if (shutdown) {
+                    lock.unlock();
                     break;
                 }
 
@@ -305,11 +362,13 @@ private:
                     exitNum--;    // 待退出线程数减1
                     liveNum--;    // 存活线程数减1
                     std::cout << "[缩容] 工作线程退出，tid=" << curTid << " 剩余存活线程数=" << liveNum << std::endl;
+                    lock.unlock();
                     break;
                 }
 
                 // 5. 防御性检查：队列空则继续等待（防止虚假唤醒）
                 if (TaskQ.empty()) {
+                    lock.unlock();
                     continue;
                 }
 
@@ -380,11 +439,11 @@ private:
             // ========== 扩容逻辑：任务堆积，线程数不足 ==========
             // 条件：任务数>存活线程数（处理不过来） 且 存活线程数<最大线程数（未达上限）
             // 加入异常测试后发现，当curLive<minNum时也需要扩容，否则不能保证最小核心数
-            if (curLive<minNum || (curQueue > curLive && curLive < maxNum)) {
+            if (curLive < minNum || (curQueue > curLive && curLive < maxNum)) {
                 std::lock_guard<std::mutex> lock(poolLock);  // 加锁保护线程列表
                 int addCount = 0;
                 // 批量新增线程：最多ADDCOUNT个，避免一次性创建过多
-                while (curLive < maxNum && addCount < ADDCOUNT && (queueSize > curLive||curLive<minNum)) {
+                while (curLive < maxNum && addCount < ADDCOUNT && (queueSize > curLive || curLive < minNum)) {
                     workerWorkers.emplace_back(
                         std::thread([this]() { this->workerFunc(); })
                     );
